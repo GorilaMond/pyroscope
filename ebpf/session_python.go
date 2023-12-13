@@ -221,6 +221,7 @@ func (s *session) loadPyPerf() (*python.Perf, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pyperf create %w", err)
 	}
+	// profile.bpf.c 的 progs map 的 0号元素 更新为 bpf/pyperf.bpf.c pyperf_collect
 	err = s.bpf.ProfileMaps.Progs.Update(uint32(0), s.pyperfBpf.PerfPrograms.PyperfCollect, ebpf.UpdateAny)
 	if err != nil {
 		return nil, fmt.Errorf("pyperf link %w", err)

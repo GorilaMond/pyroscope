@@ -33,7 +33,7 @@ import (
 	commonconfig "github.com/prometheus/common/config"
 )
 
-var configFile = flag.String("config", "", "config file path")
+var configFile = flag.String("config", "", "config file path") // -config 参数解析单元 flag包用于参数解析，参数依次为 匹配项，默认值，注释
 var server = flag.String("server", "http://localhost:4040", "")
 
 var (
@@ -170,15 +170,15 @@ func getConfig() *Config {
 	flag.Parse()
 
 	if *configFile == "" {
-		panic("config file not specified")
+		panic("config file not specified") // 未设置时报错
 	}
 	var config = new(Config)
-	*config = defaultConfig
+	*config = defaultConfig // 有默认值，由下面可知为json格式，所以配置文件内容可以是 "{}" （空的）
 	configBytes, err := os.ReadFile(*configFile)
 	if err != nil {
 		panic(err)
 	}
-	err = json.Unmarshal(configBytes, config)
+	err = json.Unmarshal(configBytes, config) // json格式解析，所以配置文件需为json格式
 	if err != nil {
 		panic(err)
 	}

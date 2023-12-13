@@ -80,7 +80,7 @@ frontend/build: frontend/deps ## Do a production build for the frontend
 
 .PHONY: frontend/deps
 frontend/deps:
-	yarn --frozen-lockfile
+	yarn
 
 .PHONY: release
 release/prereq: $(BIN)/goreleaser ## Ensure release pre requesites are met
