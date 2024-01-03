@@ -191,10 +191,12 @@ func (s *session) Start() error {
 	s.started = true
 	go func() {
 		defer s.wg.Done()
+		// 读取perf buf数据并拆分，按配置类型发送给下面三个pid处理任务
 		s.readEvents(eventsReader, pidInfoRequests, pidExecRequests, deadPIDsEvents)
 	}()
 	go func() {
 		defer s.wg.Done()
+		// 分析未知pid进程的类型并修改
 		s.processPidInfoRequests(pidInfoRequests)
 	}()
 	go func() {
@@ -269,6 +271,7 @@ func (s *session) DebugInfo() interface{} {
 	}
 }
 
+// 调用栈解析函数
 func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 	sb := &stackBuilder{}
 
@@ -297,6 +300,7 @@ func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 			continue
 		}
 
+		// 获取进程的用户态程序符号表
 		proc := s.symCache.GetProcTable(symtab.PidKey(ck.Pid))
 		if proc.Error() != nil {
 			s.pids.dead[uint32(proc.Pid())] = struct{}{}
@@ -308,6 +312,7 @@ func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 		var uStack []byte
 		var kStack []byte
 		if s.options.CollectUser {
+			// 获取调用栈
 			uStack = s.GetStack(ck.UserStack)
 		}
 		if s.options.CollectKernel {
@@ -318,6 +323,7 @@ func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 		sb.reset()
 		sb.append(s.comm(ck.Pid))
 		if s.options.CollectUser {
+			// 解析调用栈
 			s.WalkStack(sb, uStack, proc, &stats)
 		}
 		if s.options.CollectKernel {
@@ -405,6 +411,7 @@ func (s *session) stopLocked() {
 }
 
 func (s *session) setPidConfig(pid uint32, pi procInfoLite, collectUser bool, collectKernel bool) {
+	// 更新用户态pid表信息
 	s.pids.all[pid] = pi
 	config := &pyrobpf.ProfilePidConfig{
 		Type:          uint8(pi.typ),
@@ -412,6 +419,7 @@ func (s *session) setPidConfig(pid uint32, pi procInfoLite, collectUser bool, co
 		CollectKernel: uint8FromBool(collectKernel),
 	}
 
+	// 更新内核态pid表配置
 	if err := s.bpf.Pids.Update(&pid, config, ebpf.UpdateAny); err != nil {
 		_ = level.Error(s.logger).Log("msg", "updating pids map", "err", err)
 	}
@@ -478,7 +486,9 @@ func (s *session) WalkStack(sb *stackBuilder, stack []byte, resolver symtab.Symb
 	}
 	var stackFrames []string
 	for i := 0; i < 127; i++ {
+		// 截取一个地址
 		instructionPointerBytes := stack[i*8 : i*8+8]
+		// 转换为64位无符号数
 		instructionPointer := binary.LittleEndian.Uint64(instructionPointerBytes)
 		if instructionPointer == 0 {
 			break
@@ -486,20 +496,28 @@ func (s *session) WalkStack(sb *stackBuilder, stack []byte, resolver symtab.Symb
 		sym := resolver.Resolve(instructionPointer)
 		var name string
 		if sym.Name != "" {
+			// 找到了符号
 			name = sym.Name
 			stats.known++
 		} else {
+			// 没有找到符号
 			if sym.Module != "" {
+				// 找到了模块名
 				if s.options.UnknownSymbolModuleOffset {
+					// 显示模块名和偏移
 					name = fmt.Sprintf("%s+%x", sym.Module, sym.Start)
 				} else {
+					// 否则只显示模块名
 					name = sym.Module
 				}
 				stats.unknownSymbols++
 			} else {
+				// 没有模块名
 				if s.options.UnknownSymbolAddress {
+					// 显示地址
 					name = fmt.Sprintf("%x", instructionPointer)
 				} else {
+					// 否则显示：未知
 					name = "[unknown]"
 				}
 				stats.unknownModules++
@@ -507,8 +525,10 @@ func (s *session) WalkStack(sb *stackBuilder, stack []byte, resolver symtab.Symb
 		}
 		stackFrames = append(stackFrames, name)
 	}
+	// eBPF存储栈的顺序为从栈顶到栈底依次存储进数组，需要反转一次
 	lo.Reverse(stackFrames)
 	for _, s := range stackFrames {
+		// 添加进栈构造器
 		sb.append(s)
 	}
 }
@@ -586,6 +606,7 @@ func (s *session) processPidInfoRequests(pidInfoRequests <-chan uint32) {
 			if target == nil {
 				s.saveUnknownPIDLocked(pid)
 			} else {
+				// 确定进程类型并更新pids
 				s.startProfilingLocked(pid, target)
 			}
 		}()
@@ -596,6 +617,7 @@ func (s *session) startProfilingLocked(pid uint32, target *sd.Target) {
 	if !s.started {
 		return
 	}
+	// 分析进程类型
 	typ := s.selectProfilingType(pid, target)
 	if typ.typ == pyrobpf.ProfilingTypePython {
 		go s.tryStartPythonProfiling(pid, target, typ)
@@ -675,7 +697,7 @@ func (s *session) processPIDExecRequests(requests chan uint32) {
 	for pid := range requests {
 		target := s.targetFinder.FindTarget(pid)
 		_ = level.Debug(s.logger).Log("msg", "pid exec request", "pid", pid)
-		func() {
+		func() { // 为了小范围内使用defer，使互斥锁在每次循环中锁定和释放
 			s.mutex.Lock()
 			defer s.mutex.Unlock()
 
