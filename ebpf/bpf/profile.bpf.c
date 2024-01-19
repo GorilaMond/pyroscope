@@ -9,25 +9,46 @@
 
 #define PF_KTHREAD 0x00200000
 
-SEC("perf_event")
-int do_perf_event(struct bpf_perf_event_data *ctx) {
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, 1024);
+} stamps SEC(".maps");
+
+SEC("kprobe/finish_task_switch")
+int do_off_cpu(struct pt_regs *ctx) {
+    struct task_struct *prev = (struct task_struct *)PT_REGS_PARM1(ctx);
+    if(!prev) return 0;
+
     u32 tgid = 0;
-    current_pid(&tgid);
-
-    struct sample_key key = {};
-    u32 *val, one = 1;
-
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (tgid == 0 || task == 0) { // 不监测0号进程
+    int flags = 0;
+    if(pyro_bpf_core_read(&tgid, sizeof(tgid), &prev->pid)) {
+        bpf_dbg_printk("failed to read task->pid\n");
         return 0;
     }
-    int flags = 0;
-    if (pyro_bpf_core_read(&flags, sizeof(flags), &task->flags)) {
+    if (tgid == 0) { // 不监测0号进程
+        return 0;
+    }
+    if (pyro_bpf_core_read(&flags, sizeof(flags), &prev->flags)) {
         bpf_dbg_printk("failed to read task->flags\n");
         return 0;
     }
     if (flags & PF_KTHREAD) { // 不监测内核线程
         bpf_dbg_printk("skipping kthread %d\n", tgid);
+        return 0;
+    }
+    u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&stamps, &tgid, &ts, BPF_NOEXIST);
+
+    current_pid(&tgid);
+    u64 *tsp = bpf_map_lookup_elem(&stamps, &tgid);
+    if(!tsp) {
+        return 0;
+    }
+    bpf_map_delete_elem(&stamps, &tgid);
+    u32 delta = (bpf_ktime_get_ns() - *tsp) >> 20;
+    if(!delta) {
         return 0;
     }
 
@@ -54,12 +75,14 @@ int do_perf_event(struct bpf_perf_event_data *ctx) {
     if (config->type == PROFILING_TYPE_ERROR || config->type == PROFILING_TYPE_UNKNOWN) { // 为错误进程或未知进程，则直接返回
         return 0;
     }
-
     // 如果程序类型为python，则尾调用到python调用栈获取函数
     if (config->type == PROFILING_TYPE_PYTHON) {
         bpf_tail_call(ctx, &progs, PROG_IDX_PYTHON);
         return 0;
     }
+
+    struct sample_key key = {};
+    u32 *val;
 
     // 如果程序中保留栈帧信息，则使用正常的栈解析流程
     if (config->type == PROFILING_TYPE_FRAMEPOINTERS) {
@@ -76,12 +99,22 @@ int do_perf_event(struct bpf_perf_event_data *ctx) {
 
         val = bpf_map_lookup_elem(&counts, &key);
         if (val)
-            (*val)++;
+            (*val)+=delta;
         else
-            bpf_map_update_elem(&counts, &key, &one, BPF_NOEXIST); // counts 为 计数map，键类型为u32
+            bpf_map_update_elem(&counts, &key, &delta, BPF_NOEXIST); // counts 为 计数map，键类型为u32
     }
     return 0;
 }
+
+// SEC("kprobe/finish_task_switch.isra.0")
+// int do_off_cpu_vm(struct pt_regs *ctx) {
+//     return do_off_cpu(ctx);
+// }
+
+// SEC("kprobe/finish_task_switch")
+// int do_off_cpu_pm(struct pt_regs *ctx) {
+//     return do_off_cpu(ctx);
+// }
 
 // 进程退出 处理程序，向用户态报告进程退出消息
 SEC("kprobe/disassociate_ctty")

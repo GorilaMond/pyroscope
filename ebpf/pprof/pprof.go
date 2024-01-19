@@ -40,27 +40,32 @@ func (b ProfileBuilders) BuilderForTarget(hash uint64, labels labels.Labels) *Pr
 	if res != nil {
 		return res
 	}
-
+	// 创建并初始化一个构造器
 	builder := &ProfileBuilder{
 		locations:          make(map[string]*profile.Location),
 		functions:          make(map[string]*profile.Function),
 		sampleHashToSample: make(map[uint64]*profile.Sample),
 		Labels:             labels,
 		Profile: &profile.Profile{
+			// 符号表
 			Mapping: []*profile.Mapping{
 				{
 					ID: 1,
 				},
 			},
-			SampleType: []*profile.ValueType{{Type: "cpu", Unit: "nanoseconds"}},
-			Period:     time.Second.Nanoseconds() / b.SampleRate,
-			PeriodType: &profile.ValueType{Type: "cpu", Unit: "nanoseconds"},
+			// 值相关配置
+			// ===========================
+			SampleType: []*profile.ValueType{{Type: "wall", Unit: "nanoseconds"}},
+			Period:     1 << 20,
+			PeriodType: &profile.ValueType{Type: "wall", Unit: "nanoseconds"},
 			TimeNanos:  time.Now().UnixNano(),
+			//============================
 		},
 		tmpLocationIDs: make([]uint64, 0, 128),
 		tmpLocations:   make([]*profile.Location, 0, 128),
 	}
 	res = builder
+	// 完成键值对
 	b.Builders[hash] = res
 	return res
 }
@@ -78,6 +83,7 @@ type ProfileBuilder struct {
 
 func (p *ProfileBuilder) CreateSample(stacktrace []string, value uint64) {
 	sample := &profile.Sample{
+		// 计算粗略的运行时长，采样数*采样周期
 		Value: []int64{int64(value) * p.Profile.Period},
 	}
 	for _, s := range stacktrace {
