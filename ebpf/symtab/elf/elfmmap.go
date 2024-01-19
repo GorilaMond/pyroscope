@@ -148,6 +148,7 @@ func (f *MMapedElfFile) getString(start int, demangleOptions []demangle.Option) 
 			sb.Write(tmpBuf[:idx])
 			s := sb.String()
 			if len(demangleOptions) > 0 {
+				// 可处理c++、rust等语言编译出的符号
 				s = demangle.Filter(s, demangleOptions...)
 			}
 			if f.stringCache == nil {

@@ -25,6 +25,7 @@ func (s *session) getCountsMapValues() (keys []pyrobpf.ProfileSampleKey, values 
 	values = make([]uint32, mapSize)
 
 	opts := &ebpf.BatchOptions{}
+	// 批量获取map数据并删除
 	n, err := m.BatchLookupAndDelete(nil, &nextKey, keys, values, opts)
 	if n > 0 {
 		level.Debug(s.logger).Log(
