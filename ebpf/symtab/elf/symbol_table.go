@@ -72,6 +72,7 @@ func (st *SymbolTable) DebugString() string {
 	return fmt.Sprintf("SymbolTable{ f = %s , sz = %d }", st.File.FilePath(), st.Index.Values.Length())
 }
 
+// 将地址解析为符号
 func (st *SymbolTable) Resolve(addr uint64) string {
 	if len(st.Index.Names) == 0 {
 		return ""
@@ -131,6 +132,7 @@ func (f *MMapedElfFile) NewSymbolTable(opt *SymbolsOptions) (*SymbolTable, error
 	return res, nil
 }
 
+// 将索引解析为符号
 func (st *SymbolTable) symbolName(idx int) (string, error) {
 	linkIndex := st.Index.Names[idx].LinkIndex()
 	SectionHeaderLink := &st.Index.Links[linkIndex]
