@@ -35,6 +35,7 @@ func NewProfileBuilders(sampleRate int64) *ProfileBuilders {
 	return &ProfileBuilders{Builders: make(map[uint64]*ProfileBuilder), SampleRate: sampleRate}
 }
 
+// 查找或返回一个进程数据构造器
 func (b ProfileBuilders) BuilderForTarget(hash uint64, labels labels.Labels) *ProfileBuilder {
 	res := b.Builders[hash]
 	if res != nil {
@@ -53,13 +54,7 @@ func (b ProfileBuilders) BuilderForTarget(hash uint64, labels labels.Labels) *Pr
 					ID: 1,
 				},
 			},
-			// 值相关配置
-			// ===========================
-			SampleType: []*profile.ValueType{{Type: "wall", Unit: "nanoseconds"}},
-			Period:     1 << 20,
-			PeriodType: &profile.ValueType{Type: "wall", Unit: "nanoseconds"},
-			TimeNanos:  time.Now().UnixNano(),
-			//============================
+			TimeNanos: time.Now().UnixNano(),
 		},
 		tmpLocationIDs: make([]uint64, 0, 128),
 		tmpLocations:   make([]*profile.Location, 0, 128),
@@ -81,18 +76,24 @@ type ProfileBuilder struct {
 	tmpLocationIDs []uint64
 }
 
+// 为进程数据构建器创建一个样本
 func (p *ProfileBuilder) CreateSample(stacktrace []string, value uint64) {
+	// 初始化样本
 	sample := &profile.Sample{
 		// 计算粗略的运行时长，采样数*采样周期
 		Value: []int64{int64(value) * p.Profile.Period},
 	}
 	for _, s := range stacktrace {
+		// 查找或添加符号对应的位置信息
 		loc := p.addLocation(s)
+		// 将位置信息添加进样本
 		sample.Location = append(sample.Location, loc)
 	}
+	// 将样本添加进构造器
 	p.Profile.Sample = append(p.Profile.Sample, sample)
 }
 
+// 为进程数据构建器进行样本累加或创建一个样本
 func (p *ProfileBuilder) CreateSampleOrAddValue(stacktrace []string, value uint64) {
 	scaledValue := int64(value) * p.Profile.Period
 	p.tmpLocations = p.tmpLocations[:0]
@@ -103,6 +104,7 @@ func (p *ProfileBuilder) CreateSampleOrAddValue(stacktrace []string, value uint6
 		p.tmpLocationIDs = append(p.tmpLocationIDs, loc.ID)
 	}
 	h := xxhash.Sum64(uint64Bytes(p.tmpLocationIDs))
+	// 进行累加
 	sample := p.sampleHashToSample[h]
 	if sample != nil {
 		sample.Value[0] += scaledValue
@@ -161,6 +163,7 @@ func (p *ProfileBuilder) Write(dst io.Writer) (int64, error) {
 		gzipWriter.Reset(io.Discard)
 		gzipWriterPool.Put(gzipWriter)
 	}()
+	// 写入缓存
 	err := p.Profile.WriteUncompressed(gzipWriter)
 	if err != nil {
 		return 0, fmt.Errorf("ebpf profile encode %w", err)
