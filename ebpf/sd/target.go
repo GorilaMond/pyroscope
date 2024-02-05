@@ -14,6 +14,13 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
+// 对应一个进程
+//
+// "__process_pid__":       spid,
+// "__meta_process_cwd":    cwd,
+// "__meta_process_exe":    exe,
+// "__meta_process_comm":   string(comm),
+// "__meta_process_cgroup": string(cgroup),
 type DiscoveryTarget map[string]string
 
 func (t *DiscoveryTarget) DebugString() string {
@@ -46,12 +53,24 @@ type Target struct {
 	fingerprintCalculated bool
 }
 
+// 创建Target，初始化labels和servicesName
+//
+// cid不为零，则添加进labels
+// pid不为零，则添加进labels
+// target提供其他labels和serviceName
 func NewTarget(cid containerID, pid uint32, target DiscoveryTarget) *Target {
 	serviceName := target[labelServiceName]
 	if serviceName == "" {
 		serviceName = inferServiceName(target)
 	}
 
+	// lset 为target的标签初始化表，规定有以下标签：
+	// labelContainerID    = "__container_id__"
+	// labelPID            = "__process_pid__"
+	// labelServiceName    = "service_name"
+	// labelServiceNameK8s = "__meta_kubernetes_pod_annotation_pyroscope_io_service_name"
+	// MetricName   = "__name__"
+	// 默认的 MetricName 在其中对应的值为 metricValue = "process_cpu"
 	lset := make(map[string]string, len(target))
 	for k, v := range target {
 		if strings.HasPrefix(k, model.ReservedLabelPrefix) && k != labels.MetricName {
@@ -72,6 +91,7 @@ func NewTarget(cid containerID, pid uint32, target DiscoveryTarget) *Target {
 		lset[labelPID] = strconv.Itoa(int(pid))
 	}
 	return &Target{
+		// 将map展开为label的list
 		labels:      labels.FromMap(lset),
 		serviceName: serviceName,
 	}
@@ -81,6 +101,7 @@ func (t *Target) ServiceName() string {
 	return t.serviceName
 }
 
+// 获取k8s或docker的容器名
 func inferServiceName(target DiscoveryTarget) string {
 	k8sServiceName := target[labelServiceNameK8s]
 	if k8sServiceName != "" {
@@ -138,6 +159,7 @@ type targetFinder struct {
 	sync sync.Mutex
 }
 
+// 创建目标查找器并设置所有成员
 func NewTargetFinder(fs fs.FS, l log.Logger, options TargetsOptions) (TargetFinder, error) {
 	containerIDCache, err := lru.New[uint32, containerID](options.ContainerCacheSize)
 	if err != nil {
@@ -152,6 +174,7 @@ func NewTargetFinder(fs fs.FS, l log.Logger, options TargetsOptions) (TargetFind
 	return res, nil
 }
 
+// 根据pid查找目标，找不到则返回默认目标
 func (tf *targetFinder) FindTarget(pid uint32) *Target {
 	tf.sync.Lock()
 	defer tf.sync.Unlock()
@@ -169,6 +192,7 @@ func (tf *targetFinder) RemoveDeadPID(pid uint32) {
 	delete(tf.pid2target, pid)
 }
 
+// 更新目标和容器缓存大小
 func (tf *targetFinder) Update(args TargetsOptions) {
 	tf.sync.Lock()
 	defer tf.sync.Unlock()
@@ -176,11 +200,13 @@ func (tf *targetFinder) Update(args TargetsOptions) {
 	tf.resizeContainerIDCache(args.ContainerCacheSize)
 }
 
+// 由目标选项转换为目标查找器的进程目标和容器目标
 func (tf *targetFinder) setTargets(opts TargetsOptions) {
 	_ = level.Debug(tf.l).Log("msg", "set targets", "count", len(opts.Targets))
 	containerID2Target := make(map[containerID]*Target)
 	pid2Target := make(map[uint32]*Target)
 	for _, target := range opts.Targets {
+		// 从目标发现器获取pid
 		if pid := pidFromTarget(target); pid != 0 {
 			t := NewTarget("", pid, target)
 			pid2Target[pid] = t
@@ -194,9 +220,12 @@ func (tf *targetFinder) setTargets(opts TargetsOptions) {
 	}
 	tf.cid2target = containerID2Target
 	tf.pid2target = pid2Target
+	// ？
+	// TargetsOnly为真，则目标查找器没有默认Target
 	if opts.TargetsOnly {
 		tf.defaultTarget = nil
 	} else {
+		// 否则，由目标选项的默认目标设置
 		t := NewTarget("", 0, opts.DefaultTarget)
 		tf.defaultTarget = t
 	}
@@ -244,6 +273,9 @@ func (tf *targetFinder) Targets() []*Target {
 	return res
 }
 
+// 从一个target中获取pid
+//
+// 查找失败返回0
 func pidFromTarget(target DiscoveryTarget) uint32 {
 	t, ok := target[labelPID]
 	if !ok {
