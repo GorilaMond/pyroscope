@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv"
@@ -39,7 +39,7 @@ func createMemberlist(t *testing.T, port, memberID int) *memberlist.KV {
 	var cfg memberlist.KVConfig
 	flagext.DefaultValues(&cfg)
 	cfg.TCPTransport = memberlist.TCPTransportConfig{
-		BindAddrs: []string{"localhost"},
+		BindAddrs: []string{"127.0.0.1"},
 		BindPort:  0,
 	}
 	cfg.GossipInterval = 10 * time.Millisecond

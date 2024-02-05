@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/grafana/dskit/tenant"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
@@ -83,7 +83,6 @@ func (f *Frontend) SelectMergeSpanProfile(ctx context.Context,
 	}
 
 	t := m.Tree()
-	t.FormatNodeNames(phlaremodel.DropGoTypeParameters)
 	return connect.NewResponse(&querierv1.SelectMergeSpanProfileResponse{
 		Flamegraph: phlaremodel.NewFlameGraph(t, c.Msg.GetMaxNodes()),
 	}), nil

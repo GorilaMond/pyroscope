@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
@@ -223,7 +223,6 @@ func (q *Querier) selectTreeFromStoreGateway(ctx context.Context, req *querierv1
 					Hints:         &ingestv1.Hints{Block: hints},
 				},
 				MaxNodes: req.MaxNodes,
-				// TODO(kolesnikovae): Max stacks.
 			})
 		}))
 	}
@@ -283,7 +282,8 @@ func (q *Querier) selectProfileFromStoreGateway(ctx context.Context, req *querie
 					Type:          profileType,
 					Hints:         &ingestv1.Hints{Block: hints},
 				},
-				MaxNodes: req.MaxNodes,
+				MaxNodes:           req.MaxNodes,
+				StackTraceSelector: req.StackTraceSelector,
 			})
 		}))
 	}
@@ -331,28 +331,6 @@ func (q *Querier) selectSeriesFromStoreGateway(ctx context.Context, req *ingeste
 		}))
 	}
 	if err := g.Wait(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	return responses, nil
-}
-
-func (q *Querier) profileTypesFromStoreGateway(ctx context.Context, req *ingesterv1.ProfileTypesRequest) ([]ResponseFromReplica[*ingesterv1.ProfileTypesResponse], error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "ProfileTypes StoreGateway")
-	defer sp.Finish()
-
-	tenantID, err := tenant.ExtractTenantIDFromContext(ctx)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
-	}
-
-	responses, err := forAllStoreGateways(ctx, tenantID, q.storeGatewayQuerier, func(ctx context.Context, ic StoreGatewayQueryClient) (*ingesterv1.ProfileTypesResponse, error) {
-		res, err := ic.ProfileTypes(ctx, connect.NewRequest(req))
-		if err != nil {
-			return nil, err
-		}
-		return res.Msg, nil
-	})
-	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return responses, nil
@@ -474,7 +452,6 @@ func (q *Querier) selectSpanProfileFromStoreGateway(ctx context.Context, req *qu
 					Hints:         &ingestv1.Hints{Block: hints},
 				},
 				MaxNodes: req.MaxNodes,
-				// TODO(kolesnikovae): Max stacks.
 			})
 		}))
 	}
@@ -487,7 +464,7 @@ func (q *Querier) selectSpanProfileFromStoreGateway(ctx context.Context, req *qu
 }
 
 func (q *Querier) blockSelectFromStoreGateway(ctx context.Context, req *ingestv1.BlockMetadataRequest) ([]ResponseFromReplica[[]*typesv1.BlockInfo], error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "Series StoreGateway")
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "blockSelect StoreGateway")
 	defer sp.Finish()
 
 	tenantID, err := tenant.ExtractTenantIDFromContext(ctx)

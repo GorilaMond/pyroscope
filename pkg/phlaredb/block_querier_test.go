@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
@@ -73,7 +73,7 @@ func TestQuerierBlockEviction(t *testing.T) {
 		for i, b := range tc.blocks {
 			q.queriers[i] = &singleBlockQuerier{
 				meta:    &block.Meta{ULID: ulid.MustParse(b)},
-				metrics: newBlocksMetrics(nil),
+				metrics: NewBlocksMetrics(nil),
 			}
 		}
 
@@ -144,7 +144,7 @@ func TestBlockCompatability(t *testing.T) {
 				pcIt := &profileCounter{Iterator: it}
 
 				// TODO: It would be nice actually comparing the whole profile, but at present the result is not deterministic.
-				_, err = q.MergePprof(ctx, pcIt, 0)
+				_, err = q.MergePprof(ctx, pcIt, 0, nil)
 				require.NoError(t, err)
 
 				profileCount += pcIt.count
@@ -230,6 +230,21 @@ func (f *fakeQuerier) SelectMatchingProfiles(ctx context.Context, params *ingest
 	return iter.NewSliceIterator(profiles), nil
 }
 
+func openSingleBlockQuerierIndex(t *testing.T, blockID string) *singleBlockQuerier {
+	t.Helper()
+
+	reader, err := index.NewFileReader(fmt.Sprintf("testdata/%s/index.tsdb", blockID))
+	require.NoError(t, err)
+
+	q := &singleBlockQuerier{
+		metrics: NewBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse(blockID)},
+		opened:  true, // Skip trying to open the block.
+		index:   reader,
+	}
+	return q
+}
+
 func TestSelectMatchingProfilesCleanUp(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
@@ -245,15 +260,7 @@ func TestSelectMatchingProfilesCleanUp(t *testing.T) {
 
 func Test_singleBlockQuerier_Series(t *testing.T) {
 	ctx := context.Background()
-	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
-	assert.NoError(t, err)
-
-	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
-		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
-		opened:  true, // Skip trying to open the block.
-		index:   reader,
-	}
+	q := openSingleBlockQuerierIndex(t, "01HA2V3CPSZ9E0HMQNNHH89WSS")
 
 	t.Run("get all names", func(t *testing.T) {
 		want := []string{
@@ -729,7 +736,7 @@ func Test_singleBlockQuerier_LabelNames(t *testing.T) {
 	assert.NoError(t, err)
 
 	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
+		metrics: NewBlocksMetrics(nil),
 		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
 		opened:  true, // Skip trying to open the block.
 		index:   reader,
@@ -861,7 +868,7 @@ func Test_singleBlockQuerier_LabelValues(t *testing.T) {
 	assert.NoError(t, err)
 
 	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
+		metrics: NewBlocksMetrics(nil),
 		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
 		opened:  true, // Skip trying to open the block.
 		index:   reader,
@@ -960,7 +967,7 @@ func Test_singleBlockQuerier_ProfileTypes(t *testing.T) {
 	assert.NoError(t, err)
 
 	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
+		metrics: NewBlocksMetrics(nil),
 		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
 		opened:  true, // Skip trying to open the block.
 		index:   reader,
@@ -1055,13 +1062,15 @@ func Test_singleBlockQuerier_ProfileTypes(t *testing.T) {
 }
 
 func Benchmark_singleBlockQuerier_Series(b *testing.B) {
+	const id = "01HA2V3CPSZ9E0HMQNNHH89WSS"
+
 	ctx := context.Background()
-	reader, err := index.NewFileReader("testdata/01HA2V3CPSZ9E0HMQNNHH89WSS/index.tsdb")
+	reader, err := index.NewFileReader(fmt.Sprintf("testdata/%s/index.tsdb", id))
 	assert.NoError(b, err)
 
 	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
-		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
+		metrics: NewBlocksMetrics(nil),
+		meta:    &block.Meta{ULID: ulid.MustParse(id)},
 		opened:  true, // Skip trying to open the block.
 		index:   reader,
 	}
@@ -1083,6 +1092,15 @@ func Benchmark_singleBlockQuerier_Series(b *testing.B) {
 			})
 		}
 	})
+
+	b.Run("UI request", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			q.Series(ctx, &ingestv1.SeriesRequest{ //nolint:errcheck
+				Matchers:   []string{},
+				LabelNames: []string{"pyroscope_app", "service_name", "__profile_type__", "__type__", "__name__"},
+			})
+		}
+	})
 }
 
 func Benchmark_singleBlockQuerier_LabelNames(b *testing.B) {
@@ -1091,7 +1109,7 @@ func Benchmark_singleBlockQuerier_LabelNames(b *testing.B) {
 	assert.NoError(b, err)
 
 	q := &singleBlockQuerier{
-		metrics: newBlocksMetrics(nil),
+		metrics: NewBlocksMetrics(nil),
 		meta:    &block.Meta{ULID: ulid.MustParse("01HA2V3CPSZ9E0HMQNNHH89WSS")},
 		opened:  true, // Skip trying to open the block.
 		index:   reader,
@@ -1194,7 +1212,7 @@ func TestSelectMergeLabels(t *testing.T) {
 		},
 		Start: 0,
 		End:   int64(model.TimeFromUnixNano(math.MaxInt64)),
-	}, "job")
+	}, nil, "job")
 	require.NoError(t, err)
 	expected := []*typesv1.Series{
 		{
@@ -1208,6 +1226,55 @@ func TestSelectMergeLabels(t *testing.T) {
 		{
 			Labels: phlaremodel.LabelsFromStrings("job", "c"),
 			Points: genPoints(5),
+		},
+	}
+	require.Equal(t, expected, merge)
+	require.NoError(t, querier.Close())
+}
+
+func TestSelectMergeLabels_StackTraceSelector(t *testing.T) {
+	ctx := context.Background()
+
+	querier := newBlock(t, func() (res []*testhelper.ProfileBuilder) {
+		for i := int64(1); i < 7; i++ {
+			// Keep in mind that leaf is at location[0].
+			res = append(res, testhelper.NewProfileBuilder(int64(time.Second)*i).
+				CPUProfile().
+				WithLabels("job", "a").
+				ForStacktraceString("foo").AddSamples(1).
+				ForStacktraceString("baz", "bar", "foo").AddSamples(1).
+				ForStacktraceString("baz", "foo").AddSamples(1),
+			)
+		}
+		return res
+	})
+
+	err := querier.Open(ctx)
+	require.NoError(t, err)
+
+	merge, err := querier.SelectMergeByLabels(ctx, &ingesterv1.SelectProfilesRequest{
+		LabelSelector: `{}`,
+		Type: &typesv1.ProfileType{
+			ID:         "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+			Name:       "process_cpu",
+			SampleType: "cpu",
+			SampleUnit: "nanoseconds",
+			PeriodType: "cpu",
+			PeriodUnit: "nanoseconds",
+		},
+		Start: 0,
+		End:   int64(model.TimeFromUnixNano(math.MaxInt64)),
+	}, &typesv1.StackTraceSelector{
+		CallSite: []*typesv1.Location{
+			{Name: "foo"},
+			{Name: "bar"},
+		},
+	}, "job")
+	require.NoError(t, err)
+	expected := []*typesv1.Series{
+		{
+			Labels: phlaremodel.LabelsFromStrings("job", "a"),
+			Points: genPoints(6),
 		},
 	}
 	require.Equal(t, expected, merge)

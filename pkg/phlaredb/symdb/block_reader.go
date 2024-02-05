@@ -35,6 +35,10 @@ type Reader struct {
 	partitions    []*partition
 	partitionsMap map[uint64]*partition
 
+	// Indicates whether the block reader was loaded.
+	// Loaded partitions are not released.
+	loaded bool
+
 	locations parquetobj.File
 	mappings  parquetobj.File
 	functions parquetobj.File
@@ -180,7 +184,11 @@ func (r *Reader) Close() error {
 var ErrPartitionNotFound = fmt.Errorf("partition not found")
 
 func (r *Reader) Partition(ctx context.Context, partition uint64) (PartitionReader, error) {
-	return r.partition(ctx, partition)
+	p, err := r.partition(ctx, partition)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 func (r *Reader) partition(ctx context.Context, partition uint64) (*partition, error) {
@@ -188,8 +196,10 @@ func (r *Reader) partition(ctx context.Context, partition uint64) (*partition, e
 	if !ok {
 		return nil, ErrPartitionNotFound
 	}
-	if err := p.init(ctx); err != nil {
-		return nil, err
+	if !r.loaded {
+		if err := p.init(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return p, nil
 }
@@ -204,9 +214,15 @@ type partition struct {
 	strings          parquetTableRange[string, *schemav1.StringPersister]
 }
 
-func (p *partition) init(ctx context.Context) (err error) { return p.tx().fetch(ctx) }
+func (p *partition) init(ctx context.Context) (err error) {
+	return p.tx().fetch(ctx)
+}
 
-func (p *partition) Release() { p.tx().release() }
+func (p *partition) Release() {
+	if !p.reader.loaded {
+		p.tx().release()
+	}
+}
 
 func (p *partition) tx() *fetchTx {
 	tx := make(fetchTx, 0, len(p.stacktraceChunks)+4)

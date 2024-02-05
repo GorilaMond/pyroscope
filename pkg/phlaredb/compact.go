@@ -11,9 +11,13 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/multierror"
 	"github.com/grafana/dskit/runutil"
 	"github.com/oklog/ulid"
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 	"github.com/parquet-go/parquet-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
@@ -23,6 +27,7 @@ import (
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
 	phlareparquet "github.com/grafana/pyroscope/pkg/parquet"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
+	"github.com/grafana/pyroscope/pkg/phlaredb/downsample"
 	schemav1 "github.com/grafana/pyroscope/pkg/phlaredb/schemas/v1"
 	"github.com/grafana/pyroscope/pkg/phlaredb/sharding"
 	"github.com/grafana/pyroscope/pkg/phlaredb/symdb"
@@ -32,6 +37,7 @@ import (
 )
 
 type BlockReader interface {
+	Open(context.Context) error
 	Meta() block.Meta
 	Profiles() ProfileReader
 	Index() IndexReader
@@ -46,47 +52,80 @@ type ProfileReader interface {
 	RowGroups() []parquet.RowGroup
 }
 
+type CompactWithSplittingOpts struct {
+	Src                []BlockReader
+	Dst                string
+	SplitCount         uint64
+	StageSize          uint64
+	SplitBy            SplitByFunc
+	DownsamplerEnabled bool
+	Logger             log.Logger
+}
+
 func Compact(ctx context.Context, src []BlockReader, dst string) (meta block.Meta, err error) {
-	metas, err := CompactWithSplitting(ctx, src, 1, 0, dst, SplitByFingerprint)
+	metas, err := CompactWithSplitting(ctx, CompactWithSplittingOpts{
+		Src:                src,
+		Dst:                dst,
+		SplitCount:         1,
+		StageSize:          0,
+		SplitBy:            SplitByFingerprint,
+		DownsamplerEnabled: true,
+		Logger:             util.Logger,
+	})
 	if err != nil {
 		return block.Meta{}, err
 	}
 	return metas[0], nil
 }
 
-func CompactWithSplitting(ctx context.Context, src []BlockReader, splitCount, stageSize uint64, dst string, splitBy SplitByFunc) (
+func CompactWithSplitting(ctx context.Context, opts CompactWithSplittingOpts) (
 	[]block.Meta, error,
 ) {
-	if len(src) <= 1 && splitCount == 1 {
+	if len(opts.Src) <= 1 && opts.SplitCount == 1 {
 		return nil, errors.New("not enough blocks to compact")
 	}
-	if splitCount == 0 {
-		splitCount = 1
+	if opts.SplitCount == 0 {
+		opts.SplitCount = 1
 	}
-	if stageSize == 0 || stageSize > splitCount {
-		stageSize = splitCount
+	if opts.StageSize == 0 || opts.StageSize > opts.SplitCount {
+		opts.StageSize = opts.SplitCount
 	}
 	var (
-		writers  = make([]*blockWriter, splitCount)
-		srcMetas = make([]block.Meta, len(src))
+		writers  = make([]*blockWriter, opts.SplitCount)
+		srcMetas = make([]block.Meta, len(opts.Src))
 		outMetas = make([]block.Meta, 0, len(writers))
 		err      error
 	)
-	for i, b := range src {
+	for i, b := range opts.Src {
 		srcMetas[i] = b.Meta()
 	}
 
+	symbolsCompactor := newSymbolsCompactor(opts.Dst)
+	defer runutil.CloseWithLogOnErr(util.Logger, symbolsCompactor, "close symbols compactor")
+
 	outMeta := compactMetas(srcMetas...)
-	for _, stage := range splitStages(len(writers), int(stageSize)) {
+	for _, stage := range splitStages(len(writers), int(opts.StageSize)) {
 		for _, idx := range stage {
-			if writers[idx], err = createBlockWriter(dst, outMeta, splitCount, idx); err != nil {
+			if writers[idx], err = createBlockWriter(blockWriterOpts{
+				dst:                opts.Dst,
+				meta:               outMeta,
+				splitCount:         opts.SplitCount,
+				shard:              idx,
+				rewriterFn:         symbolsCompactor.Rewriter,
+				downsamplerEnabled: opts.DownsamplerEnabled,
+				logger:             opts.Logger,
+			}); err != nil {
 				return nil, fmt.Errorf("create block writer: %w", err)
 			}
 		}
 		var metas []block.Meta
-		if metas, err = compact(ctx, writers, src, splitBy, splitCount); err != nil {
+		sp, ctx := opentracing.StartSpanFromContext(ctx, "compact.Stage", opentracing.Tag{Key: "stage", Value: stage})
+		if metas, err = compact(ctx, writers, opts.Src, opts.SplitBy, opts.SplitCount); err != nil {
+			sp.Finish()
+			ext.LogError(sp, err)
 			return nil, err
 		}
+		sp.Finish()
 		outMetas = append(outMetas, metas...)
 		// Writers are already closed, and must be GCed.
 		for j := range writers {
@@ -114,16 +153,17 @@ func splitStages(n, s int) (stages [][]int) {
 	return stages
 }
 
-func createBlockWriter(dst string, m block.Meta, splitCount uint64, shard int) (*blockWriter, error) {
-	meta := m.Clone()
+func createBlockWriter(opts blockWriterOpts) (*blockWriter, error) {
+	meta := opts.meta.Clone()
 	meta.ULID = ulid.MustNew(meta.ULID.Time(), rand.Reader)
-	if splitCount > 1 {
+	if opts.splitCount > 1 {
 		if meta.Labels == nil {
 			meta.Labels = make(map[string]string)
 		}
-		meta.Labels[sharding.CompactorShardIDLabel] = sharding.FormatShardIDLabelValue(uint64(shard), splitCount)
+		meta.Labels[sharding.CompactorShardIDLabel] = sharding.FormatShardIDLabelValue(uint64(opts.shard), opts.splitCount)
 	}
-	return newBlockWriter(dst, meta)
+	opts.meta = *meta
+	return newBlockWriter(opts)
 }
 
 func compact(ctx context.Context, writers []*blockWriter, readers []BlockReader, splitBy SplitByFunc, splitCount uint64) ([]block.Meta, error) {
@@ -147,6 +187,8 @@ func compact(ctx context.Context, writers []*blockWriter, readers []BlockReader,
 	if err = rowsIt.Err(); err != nil {
 		return nil, err
 	}
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "compact.Close")
+	defer sp.Finish()
 
 	// Close all blocks
 	errs := multierror.New()
@@ -185,15 +227,33 @@ var SplitByStacktracePartition = func(r profileRow, shardsCount uint64) uint64 {
 
 type blockWriter struct {
 	indexRewriter   *indexRewriter
-	symbolsRewriter *symbolsRewriter
+	symbolsRewriter SymbolsRewriter
 	profilesWriter  *profilesWriter
+	downsampler     *downsample.Downsampler
 	path            string
 	meta            *block.Meta
 	totalProfiles   uint64
 }
 
-func newBlockWriter(dst string, meta *block.Meta) (*blockWriter, error) {
-	blockPath := filepath.Join(dst, meta.ULID.String())
+type SymbolsRewriter interface {
+	ReWriteRow(profile profileRow) error
+	Close() (uint64, error)
+}
+
+type SymbolsRewriterFn func(blockPath string) SymbolsRewriter
+
+type blockWriterOpts struct {
+	dst                string
+	splitCount         uint64
+	shard              int
+	meta               block.Meta
+	rewriterFn         SymbolsRewriterFn
+	downsamplerEnabled bool
+	logger             log.Logger
+}
+
+func newBlockWriter(opts blockWriterOpts) (*blockWriter, error) {
+	blockPath := filepath.Join(opts.dst, opts.meta.ULID.String())
 
 	if err := os.MkdirAll(blockPath, 0o777); err != nil {
 		return nil, err
@@ -204,12 +264,22 @@ func newBlockWriter(dst string, meta *block.Meta) (*blockWriter, error) {
 		return nil, err
 	}
 
+	var downsampler *downsample.Downsampler
+	if opts.downsamplerEnabled && opts.meta.Compaction.Level > 2 {
+		level.Debug(opts.logger).Log("msg", "downsampling enabled for block writer", "path", blockPath)
+		downsampler, err = downsample.NewDownsampler(blockPath, opts.logger)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &blockWriter{
 		indexRewriter:   newIndexRewriter(blockPath),
-		symbolsRewriter: newSymbolsRewriter(blockPath),
+		symbolsRewriter: opts.rewriterFn(blockPath),
 		profilesWriter:  profileWriter,
+		downsampler:     downsampler,
 		path:            blockPath,
-		meta:            meta,
+		meta:            &opts.meta,
 	}, nil
 }
 
@@ -226,6 +296,12 @@ func (bw *blockWriter) WriteRow(r profileRow) error {
 	if err := bw.profilesWriter.WriteRow(r); err != nil {
 		return err
 	}
+	if bw.downsampler != nil {
+		err := bw.downsampler.AddRow(r.row, r.fp)
+		if err != nil {
+			return err
+		}
+	}
 	bw.totalProfiles++
 	return nil
 }
@@ -234,11 +310,17 @@ func (bw *blockWriter) Close(ctx context.Context) error {
 	if err := bw.indexRewriter.Close(ctx); err != nil {
 		return err
 	}
-	if err := bw.symbolsRewriter.Close(); err != nil {
+	numSamples, err := bw.symbolsRewriter.Close()
+	if err != nil {
 		return err
 	}
 	if err := bw.profilesWriter.Close(); err != nil {
 		return err
+	}
+	if bw.downsampler != nil {
+		if err := bw.downsampler.Close(); err != nil {
+			return err
+		}
 	}
 	metaFiles, err := metaFilesFromDir(bw.path)
 	if err != nil {
@@ -247,7 +329,7 @@ func (bw *blockWriter) Close(ctx context.Context) error {
 	bw.meta.Files = metaFiles
 	bw.meta.Stats.NumProfiles = bw.totalProfiles
 	bw.meta.Stats.NumSeries = bw.indexRewriter.NumSeries()
-	bw.meta.Stats.NumSamples = bw.symbolsRewriter.NumSamples()
+	bw.meta.Stats.NumSamples = numSamples
 	bw.meta.Compaction.Deletable = bw.totalProfiles == 0
 	if _, err := bw.meta.WriteToFile(util.Logger, bw.path); err != nil {
 		return err
@@ -642,29 +724,62 @@ func (it *dedupeProfileRowIterator) Next() bool {
 	}
 }
 
-type symbolsRewriter struct {
+type symbolsCompactor struct {
 	rewriters   map[BlockReader]*symdb.Rewriter
 	w           *symdb.SymDB
 	stacktraces []uint32
 
-	numSamples uint64
+	dst     string
+	flushed bool
 }
 
-func newSymbolsRewriter(path string) *symbolsRewriter {
-	return &symbolsRewriter{
+func newSymbolsCompactor(path string) *symbolsCompactor {
+	dst := filepath.Join(path, symdb.DefaultDirName)
+	return &symbolsCompactor{
 		w: symdb.NewSymDB(symdb.DefaultConfig().
-			WithDirectory(filepath.Join(path, symdb.DefaultDirName)).
+			WithDirectory(dst).
 			WithParquetConfig(symdb.ParquetConfig{
 				MaxBufferRowCount: defaultParquetConfig.MaxBufferRowCount,
 			})),
+		dst:       dst,
 		rewriters: make(map[BlockReader]*symdb.Rewriter),
 	}
+}
+
+func (s *symbolsCompactor) Rewriter(dst string) SymbolsRewriter {
+	return &symbolsRewriter{
+		symbolsCompactor: s,
+		dst:              dst,
+	}
+}
+
+type symbolsRewriter struct {
+	*symbolsCompactor
+
+	numSamples uint64
+	dst        string
 }
 
 func (s *symbolsRewriter) NumSamples() uint64 { return s.numSamples }
 
 func (s *symbolsRewriter) ReWriteRow(profile profileRow) error {
-	var err error
+	total, err := s.symbolsCompactor.ReWriteRow(profile)
+	s.numSamples += total
+	return err
+}
+
+func (s *symbolsRewriter) Close() (uint64, error) {
+	if err := s.symbolsCompactor.Flush(); err != nil {
+		return 0, err
+	}
+	return s.numSamples, util.CopyDir(s.symbolsCompactor.dst, filepath.Join(s.dst, symdb.DefaultDirName))
+}
+
+func (s *symbolsCompactor) ReWriteRow(profile profileRow) (uint64, error) {
+	var (
+		err              error
+		rewrittenSamples uint64
+	)
 	profile.row.ForStacktraceIDsValues(func(values []parquet.Value) {
 		s.loadStacktracesID(values)
 		r, ok := s.rewriters[profile.blockReader]
@@ -675,23 +790,34 @@ func (s *symbolsRewriter) ReWriteRow(profile profileRow) error {
 		if err = r.Rewrite(profile.row.StacktracePartitionID(), s.stacktraces); err != nil {
 			return
 		}
-		s.numSamples += uint64(len(values))
+		rewrittenSamples += uint64(len(values))
 		for i, v := range values {
 			// FIXME: the original order is not preserved, which will affect encoding.
 			values[i] = parquet.Int64Value(int64(s.stacktraces[i])).Level(v.RepetitionLevel(), v.DefinitionLevel(), v.Column())
 		}
 	})
 	if err != nil {
+		return rewrittenSamples, err
+	}
+	return rewrittenSamples, nil
+}
+
+func (s *symbolsCompactor) Flush() error {
+	if s.flushed {
+		return nil
+	}
+	if err := s.w.Flush(); err != nil {
 		return err
 	}
+	s.flushed = true
 	return nil
 }
 
-func (s *symbolsRewriter) Close() error {
-	return s.w.Flush()
+func (s *symbolsCompactor) Close() error {
+	return os.RemoveAll(s.dst)
 }
 
-func (s *symbolsRewriter) loadStacktracesID(values []parquet.Value) {
+func (s *symbolsCompactor) loadStacktracesID(values []parquet.Value) {
 	s.stacktraces = grow(s.stacktraces, len(values))
 	for i := range values {
 		s.stacktraces[i] = values[i].Uint32()

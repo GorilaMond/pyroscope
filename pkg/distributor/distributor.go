@@ -3,6 +3,7 @@ package distributor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"expvar"
 	"flag"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -23,6 +24,7 @@ import (
 	ring_client "github.com/grafana/dskit/ring/client"
 	"github.com/grafana/dskit/services"
 	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -231,8 +233,15 @@ func (d *Distributor) Push(ctx context.Context, grpcReq *connect.Request[pushv1.
 		}
 		req.Series = append(req.Series, series)
 	}
-
-	return d.PushParsed(ctx, req)
+	resp, err := d.PushParsed(ctx, req)
+	if err != nil && validation.ReasonOf(err) != validation.Unknown {
+		if sp := opentracing.SpanFromContext(ctx); sp != nil {
+			ext.LogError(sp, err)
+		}
+		level.Debug(util.LoggerWithContext(ctx, d.logger)).Log("msg", "failed to validate profile", "err", err)
+		return resp, err
+	}
+	return resp, err
 }
 
 func (d *Distributor) GetProfileLanguage(series *distributormodel.ProfileSeries) string {
@@ -314,6 +323,10 @@ func (d *Distributor) PushParsed(ctx context.Context, req *distributormodel.Push
 		for _, sample := range series.Samples {
 			sample.Profile.Normalize()
 		}
+	}
+
+	if err := injectMappingVersions(req.Series); err != nil {
+		_ = level.Warn(d.logger).Log("msg", "failed to inject mapping versions", "err", err)
 	}
 
 	// If aggregation is configured for the tenant, we try to determine
@@ -780,4 +793,26 @@ func newRingAndLifecycler(cfg util.CommonRingConfig, instanceCount *atomic.Uint3
 	}
 
 	return distributorsRing, distributorsLifecycler, nil
+}
+
+// injectMappingVersions extract from the labels the mapping version and inject it into the profile's main mapping. (mapping[0])
+func injectMappingVersions(series []*distributormodel.ProfileSeries) error {
+	for _, s := range series {
+		version, ok := phlaremodel.ServiceVersionFromLabels(s.Labels)
+		if !ok {
+			continue
+		}
+		for _, sample := range s.Samples {
+			for _, m := range sample.Profile.Mapping {
+				version.BuildID = sample.Profile.StringTable[m.BuildId]
+				versionString, err := json.Marshal(version)
+				if err != nil {
+					return err
+				}
+				sample.Profile.StringTable = append(sample.Profile.StringTable, string(versionString))
+				m.BuildId = int64(len(sample.Profile.StringTable) - 1)
+			}
+		}
+	}
+	return nil
 }

@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gorilla/mux"
@@ -27,6 +27,7 @@ import (
 	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/signals"
+	"github.com/grafana/dskit/spanprofiler"
 	wwtracing "github.com/grafana/dskit/tracing"
 	"github.com/grafana/pyroscope-go"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -57,7 +58,6 @@ import (
 	"github.com/grafana/pyroscope/pkg/usagestats"
 	"github.com/grafana/pyroscope/pkg/util"
 	"github.com/grafana/pyroscope/pkg/util/cli"
-	"github.com/grafana/pyroscope/pkg/util/spanprofiler"
 	"github.com/grafana/pyroscope/pkg/validation"
 	"github.com/grafana/pyroscope/pkg/validation/exporter"
 )
@@ -301,10 +301,11 @@ func (f *Phlare) setupModuleManager() error {
 	mm.RegisterModule(Admin, f.initAdmin)
 	mm.RegisterModule(All, nil)
 	mm.RegisterModule(TenantSettings, f.initTenantSettings)
+	mm.RegisterModule(AdHocProfiles, f.initAdHocProfiles)
 
 	// Add dependencies
 	deps := map[string][]string{
-		All: {Ingester, Distributor, QueryScheduler, QueryFrontend, Querier, StoreGateway, Admin, TenantSettings},
+		All: {Ingester, Distributor, QueryScheduler, QueryFrontend, Querier, StoreGateway, Admin, TenantSettings, Compactor, AdHocProfiles},
 
 		Server:            {GRPCGateway},
 		API:               {Server},
@@ -323,7 +324,8 @@ func (f *Phlare) setupModuleManager() error {
 		MemberlistKV:      {API},
 		Admin:             {API, Storage},
 		Version:           {API, MemberlistKV},
-		TenantSettings:    {API},
+		TenantSettings:    {API, Storage},
+		AdHocProfiles:     {API, Overrides, Storage},
 	}
 
 	for mod, targets := range deps {

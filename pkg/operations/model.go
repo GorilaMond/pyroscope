@@ -2,7 +2,10 @@ package operations
 
 import (
 	"net/http"
+	"strings"
 	"time"
+
+	"golang.org/x/exp/slices"
 
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
 )
@@ -44,27 +47,43 @@ func readQuery(r *http.Request) *blockQuery {
 }
 
 type blockDetails struct {
-	ID               string
-	MinTime          string
-	MaxTime          string
-	Duration         int
-	UploadedAt       string
-	CompactorShardID string
-	CompactionLevel  int
-	Size             string
-	Stats            block.BlockStats
-	Labels           map[string]string
+	ID                string
+	MinTime           string
+	MaxTime           string
+	Duration          int
+	FormattedDuration string
+	UploadedAt        string
+	CompactorShardID  string
+	CompactionLevel   int
+	Size              string
+	Stats             block.BlockStats
+	Labels            map[string]string
 }
 
 type blockGroup struct {
-	MinTime          time.Time
-	FormattedMinTime string
-	Blocks           []*blockDetails
-	MinTimeAge       string
+	MinTime                 time.Time
+	FormattedMinTime        string
+	Blocks                  []*blockDetails
+	MinTimeAge              string
+	MaxBlockDurationMinutes int
 }
 
 type blockListResult struct {
-	BlockGroups       []*blockGroup
-	MaxBlocksPerGroup int
-	GroupDuration     int
+	BlockGroups          []*blockGroup
+	MaxBlocksPerGroup    int
+	GroupDurationMinutes int
+}
+
+// Sorts a slice of block groups by MinTime in descending order.
+func sortBlockGroupsByMinTimeDec(bg []*blockGroup) {
+	slices.SortFunc(bg, func(a, b *blockGroup) int {
+		return b.MinTime.Compare(a.MinTime)
+	})
+}
+
+// Sorts a slice of block details by MinTime in descending order.
+func sortBlockDetailsByMinTimeDec(bd []*blockDetails) {
+	slices.SortFunc(bd, func(a, b *blockDetails) int {
+		return strings.Compare(b.MinTime, a.MinTime)
+	})
 }

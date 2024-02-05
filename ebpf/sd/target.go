@@ -45,7 +45,6 @@ const (
 )
 
 type Target struct {
-
 	// todo make keep it a map until Append happens
 	labels                labels.Labels
 	serviceName           string
@@ -115,6 +114,12 @@ func inferServiceName(target DiscoveryTarget) string {
 	dockerContainer := target["__meta_docker_container_name"]
 	if dockerContainer != "" {
 		return dockerContainer
+	}
+	if swarmService := target["__meta_dockerswarm_container_label_service_name"]; swarmService != "" {
+		return swarmService
+	}
+	if swarmService := target["__meta_dockerswarm_service_name"]; swarmService != "" {
+		return swarmService
 	}
 	return "unspecified"
 }
@@ -301,6 +306,9 @@ func containerIDFromTarget(target DiscoveryTarget) containerID {
 	}
 	cid, ok = target["__meta_docker_container_id"]
 	if ok && cid != "" {
+		return containerID(cid)
+	}
+	if cid, ok = target["__meta_dockerswarm_task_container_id"]; ok && cid != "" {
 		return containerID(cid)
 	}
 	return ""

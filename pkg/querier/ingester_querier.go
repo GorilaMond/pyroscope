@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/grafana/dskit/ring"
 	ring_client "github.com/grafana/dskit/ring/client"
 	"github.com/opentracing/opentracing-go"
@@ -184,7 +184,8 @@ func (q *Querier) selectProfileFromIngesters(ctx context.Context, req *querierv1
 					Type:          profileType,
 					Hints:         &ingestv1.Hints{Block: hints},
 				},
-				MaxNodes: req.MaxNodes,
+				MaxNodes:           req.MaxNodes,
+				StackTraceSelector: req.StackTraceSelector,
 			})
 		}))
 	}
@@ -230,23 +231,6 @@ func (q *Querier) selectSeriesFromIngesters(ctx context.Context, req *ingesterv1
 		}))
 	}
 	if err := g.Wait(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	return responses, nil
-}
-
-func (q *Querier) profileTypesFromIngesters(ctx context.Context, req *ingesterv1.ProfileTypesRequest) ([]ResponseFromReplica[*ingesterv1.ProfileTypesResponse], error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "ProfileTypes Ingesters")
-	defer sp.Finish()
-
-	responses, err := forAllIngesters(ctx, q.ingesterQuerier, func(childCtx context.Context, ic IngesterQueryClient) (*ingesterv1.ProfileTypesResponse, error) {
-		res, err := ic.ProfileTypes(childCtx, connect.NewRequest(req))
-		if err != nil {
-			return nil, err
-		}
-		return res.Msg, nil
-	})
-	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return responses, nil

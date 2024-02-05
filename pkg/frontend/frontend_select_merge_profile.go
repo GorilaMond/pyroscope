@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/grafana/dskit/tenant"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
@@ -61,11 +61,12 @@ func (f *Frontend) SelectMergeProfile(ctx context.Context, c *connect.Request[qu
 		r := intervals.At()
 		g.Go(func() error {
 			req := connectgrpc.CloneRequest(c, &querierv1.SelectMergeProfileRequest{
-				ProfileTypeID: c.Msg.ProfileTypeID,
-				LabelSelector: c.Msg.LabelSelector,
-				Start:         r.Start.UnixMilli(),
-				End:           r.End.UnixMilli(),
-				MaxNodes:      c.Msg.MaxNodes,
+				ProfileTypeID:      c.Msg.ProfileTypeID,
+				LabelSelector:      c.Msg.LabelSelector,
+				Start:              r.Start.UnixMilli(),
+				End:                r.End.UnixMilli(),
+				MaxNodes:           c.Msg.MaxNodes,
+				StackTraceSelector: c.Msg.StackTraceSelector,
 			})
 			resp, err := connectgrpc.RoundTripUnary[
 				querierv1.SelectMergeProfileRequest,

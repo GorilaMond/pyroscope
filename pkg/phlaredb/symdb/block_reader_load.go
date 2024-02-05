@@ -20,14 +20,18 @@ import (
 // The main user of the function is Rewriter: as far as is not
 // known which partitions will be fetched in advance, but it is
 // known that all of them or majority will be requested, preloading
-// all of them is more efficient yet consumes more memory.
+// is more efficient yet consumes more memory.
 func (r *Reader) Load(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return r.loadStacktraces(ctx) })
 	if r.index.Header.Version > FormatV1 {
 		r.loadParquetTables(g)
 	}
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	r.loaded = true
+	return nil
 }
 
 func (r *Reader) loadStacktraces(ctx context.Context) error {

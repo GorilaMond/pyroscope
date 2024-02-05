@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-kit/log"
 	"github.com/oklog/ulid"
 	"github.com/parquet-go/parquet-go"
 	"github.com/prometheus/common/model"
@@ -23,8 +24,10 @@ import (
 	phlaremodel "github.com/grafana/pyroscope/pkg/model"
 	"github.com/grafana/pyroscope/pkg/objstore/client"
 	"github.com/grafana/pyroscope/pkg/objstore/providers/filesystem"
+	phlarecontext "github.com/grafana/pyroscope/pkg/phlare/context"
 	"github.com/grafana/pyroscope/pkg/phlaredb/block"
 	"github.com/grafana/pyroscope/pkg/phlaredb/sharding"
+	"github.com/grafana/pyroscope/pkg/phlaredb/symdb"
 	"github.com/grafana/pyroscope/pkg/phlaredb/tsdb/index"
 	"github.com/grafana/pyroscope/pkg/pprof/testhelper"
 )
@@ -68,7 +71,7 @@ func TestCompact(t *testing.T) {
 	}
 	it, err := querier.SelectMatchingProfiles(ctx, matchAll)
 	require.NoError(t, err)
-	series, err := querier.MergeByLabels(ctx, it, "job")
+	series, err := querier.MergeByLabels(ctx, it, nil, "job")
 	require.NoError(t, err)
 	require.Equal(t, []*typesv1.Series{
 		{Labels: phlaremodel.LabelsFromStrings("job", "a"), Points: []*typesv1.Point{{Value: float64(1), Timestamp: int64(1000)}}},
@@ -85,6 +88,82 @@ func TestCompact(t *testing.T) {
 	expected := new(phlaremodel.Tree)
 	expected.InsertStack(3, "baz", "bar", "foo")
 	require.Equal(t, expected.String(), res.String())
+}
+
+func TestCompactWithDownsampling(t *testing.T) {
+	ctx := context.Background()
+	b := newBlock(t, func() []*testhelper.ProfileBuilder {
+		return []*testhelper.ProfileBuilder{
+			testhelper.NewProfileBuilder(int64(time.Hour-time.Minute)).
+				CPUProfile().
+				WithLabels(
+					"job", "a",
+				).ForStacktraceString("foo", "bar", "baz").AddSamples(1),
+			testhelper.NewProfileBuilder(int64(time.Hour+time.Minute)).
+				CPUProfile().
+				WithLabels(
+					"job", "b",
+				).ForStacktraceString("foo", "bar", "baz").AddSamples(1),
+			testhelper.NewProfileBuilder(int64(time.Hour+6*time.Minute)).
+				CPUProfile().
+				WithLabels(
+					"job", "c",
+				).ForStacktraceString("foo", "bar", "baz").AddSamples(1),
+		}
+	})
+	dst := t.TempDir()
+	b.meta.Compaction.Level = 2
+	compacted, err := Compact(ctx, []BlockReader{b, b, b, b}, dst)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), compacted.Stats.NumProfiles)
+	require.Equal(t, uint64(3), compacted.Stats.NumSamples)
+	require.Equal(t, uint64(3), compacted.Stats.NumSeries)
+	require.Equal(t, model.Time((time.Hour - time.Minute).Milliseconds()), compacted.MinTime)
+	require.Equal(t, model.Time((time.Hour + 6*time.Minute).Milliseconds()), compacted.MaxTime)
+
+	for _, f := range []*block.File{
+		compacted.FileByRelPath("profiles_5m_sum.parquet"),
+		compacted.FileByRelPath("profiles_1h_sum.parquet"),
+	} {
+		require.NotNil(t, f)
+		assert.NotZero(t, f.SizeBytes)
+	}
+
+	querier := blockQuerierFromMeta(t, dst, compacted)
+	matchAll := &ingesterv1.SelectProfilesRequest{
+		LabelSelector: "{}",
+		Type:          mustParseProfileSelector(t, "process_cpu:cpu:nanoseconds:cpu:nanoseconds"),
+		Start:         0,
+		End:           (time.Hour + 7*time.Minute - time.Millisecond).Milliseconds(),
+	}
+	it, err := querier.SelectMatchingProfiles(ctx, matchAll)
+	require.NoError(t, err)
+	series, err := querier.MergeByLabels(ctx, it, nil, "job")
+	require.NoError(t, err)
+	require.Equal(t, []*typesv1.Series{
+		{Labels: phlaremodel.LabelsFromStrings("job", "a"), Points: []*typesv1.Point{{Value: float64(1), Timestamp: (time.Hour - time.Minute).Milliseconds()}}},
+		{Labels: phlaremodel.LabelsFromStrings("job", "b"), Points: []*typesv1.Point{{Value: float64(1), Timestamp: (time.Hour + time.Minute).Milliseconds()}}},
+		{Labels: phlaremodel.LabelsFromStrings("job", "c"), Points: []*typesv1.Point{{Value: float64(1), Timestamp: (time.Hour + 6*time.Minute).Milliseconds()}}},
+	}, series)
+
+	it, err = querier.SelectMatchingProfiles(ctx, matchAll)
+	require.NoError(t, err)
+	res, err := querier.MergeByStacktraces(ctx, it)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	expected := new(phlaremodel.Tree)
+	expected.InsertStack(3, "baz", "bar", "foo")
+	require.Equal(t, expected.String(), res.String())
+
+	res, err = querier.SelectMergeByStacktraces(ctx, matchAll)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, expected.String(), res.String())
+	assert.False(t, querier.metrics.profileTableAccess.DeleteLabelValues(""))
+	assert.True(t, querier.metrics.profileTableAccess.DeleteLabelValues("profiles_5m_sum.parquet"))
+	assert.True(t, querier.metrics.profileTableAccess.DeleteLabelValues("profiles_1h_sum.parquet"))
+	assert.True(t, querier.metrics.profileTableAccess.DeleteLabelValues("profiles.parquet"))
 }
 
 func TestCompactWithSplitting(t *testing.T) {
@@ -108,8 +187,18 @@ func TestCompactWithSplitting(t *testing.T) {
 		)
 	})
 	dst := t.TempDir()
-	compacted, err := CompactWithSplitting(ctx, []BlockReader{b1, b2, b2, b1}, 16, 8, dst, SplitByFingerprint)
+	compacted, err := CompactWithSplitting(ctx, CompactWithSplittingOpts{
+		Src:                []BlockReader{b1, b2, b2, b1},
+		Dst:                dst,
+		SplitCount:         16,
+		StageSize:          8,
+		SplitBy:            SplitByFingerprint,
+		DownsamplerEnabled: true,
+		Logger:             log.NewNopLogger(),
+	})
 	require.NoError(t, err)
+
+	require.NoDirExists(t, filepath.Join(dst, symdb.DefaultDirName))
 
 	// 4 shards one per series.
 	require.Equal(t, 4, len(compacted))
@@ -167,7 +256,7 @@ func TestCompactWithSplitting(t *testing.T) {
 	// Then we query 2 different shards and verify we have a subset of series.
 	it, err = queriers[0].SelectMatchingProfiles(ctx, matchAll)
 	require.NoError(t, err)
-	seriesResult, err := queriers[0].MergeByLabels(context.Background(), it, "job")
+	seriesResult, err := queriers[0].MergeByLabels(context.Background(), it, nil, "job")
 	require.NoError(t, err)
 	require.Equal(t,
 		[]*typesv1.Series{
@@ -179,7 +268,7 @@ func TestCompactWithSplitting(t *testing.T) {
 
 	it, err = queriers[1].SelectMatchingProfiles(ctx, matchAll)
 	require.NoError(t, err)
-	seriesResult, err = queriers[1].MergeByLabels(context.Background(), it, "job")
+	seriesResult, err = queriers[1].MergeByLabels(context.Background(), it, nil, "job")
 	require.NoError(t, err)
 	require.Equal(t,
 		[]*typesv1.Series{
@@ -495,8 +584,14 @@ func TestCompactOldBlock(t *testing.T) {
 	require.NoError(t, err)
 	br := NewSingleBlockQuerierFromMeta(context.Background(), bkt, meta)
 	require.NoError(t, br.Open(ctx))
-	_, err = CompactWithSplitting(ctx,
-		[]BlockReader{br}, 2, 0, dst, SplitByFingerprint)
+	_, err = CompactWithSplitting(ctx, CompactWithSplittingOpts{
+		Src:                []BlockReader{br},
+		Dst:                dst,
+		SplitCount:         2,
+		StageSize:          0,
+		SplitBy:            SplitByFingerprint,
+		DownsamplerEnabled: true,
+	})
 	require.NoError(t, err)
 }
 
@@ -544,10 +639,10 @@ func TestFlushMeta(t *testing.T) {
 	require.Equal(t, "symbols/strings.parquet", b.Meta().Files[7].RelPath)
 }
 
-func newBlock(t *testing.T, generator func() []*testhelper.ProfileBuilder) *singleBlockQuerier {
+func newBlock(t testing.TB, generator func() []*testhelper.ProfileBuilder) *singleBlockQuerier {
 	t.Helper()
 	dir := t.TempDir()
-	ctx := context.Background()
+	ctx := phlarecontext.WithLogger(context.Background(), log.NewNopLogger())
 	h, err := NewHead(ctx, Config{
 		DataPath:         dir,
 		MaxBlockDuration: 24 * time.Hour,
@@ -588,7 +683,7 @@ func newBlock(t *testing.T, generator func() []*testhelper.ProfileBuilder) *sing
 	return blk
 }
 
-func blockQuerierFromMeta(t *testing.T, dir string, m block.Meta) Querier {
+func blockQuerierFromMeta(t *testing.T, dir string, m block.Meta) *singleBlockQuerier {
 	t.Helper()
 	ctx := context.Background()
 	bkt, err := client.NewBucket(ctx, client.Config{
@@ -788,5 +883,41 @@ func Test_SplitStages(t *testing.T) {
 
 	for _, test := range tests {
 		assert.Equal(t, test.result, splitStages(test.n, test.s))
+	}
+}
+
+func Benchmark_CompactSplit(b *testing.B) {
+	ctx := phlarecontext.WithLogger(context.Background(), log.NewNopLogger())
+
+	bkt, err := client.NewBucket(ctx, client.Config{
+		StorageBackendConfig: client.StorageBackendConfig{
+			Backend: client.Filesystem,
+			Filesystem: filesystem.Config{
+				Directory: "./testdata/",
+			},
+		},
+		StoragePrefix: "",
+	}, "test")
+	require.NoError(b, err)
+	meta, err := block.ReadMetaFromDir("./testdata/01HHYG6245NWHZWVP27V8WJRT7")
+	require.NoError(b, err)
+	bl := NewSingleBlockQuerierFromMeta(ctx, bkt, meta)
+	require.NoError(b, bl.Open(ctx))
+	require.NoError(b, bl.Symbols().Load(ctx))
+	dst := b.TempDir()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err = CompactWithSplitting(ctx, CompactWithSplittingOpts{
+			Src:                []BlockReader{bl},
+			Dst:                dst,
+			SplitCount:         32,
+			StageSize:          32,
+			SplitBy:            SplitByFingerprint,
+			DownsamplerEnabled: true,
+			Logger:             log.NewNopLogger(),
+		})
+		require.NoError(b, err)
 	}
 }

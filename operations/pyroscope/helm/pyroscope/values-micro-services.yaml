@@ -55,6 +55,7 @@ pyroscope:
     compactor:
       kind: StatefulSet
       replicaCount: 3
+      terminationGracePeriodSeconds: 1200
       persistence:
         enabled: false
       resources:
@@ -67,8 +68,8 @@ pyroscope:
       kind: StatefulSet
       replicaCount: 3
       persistence:
-      # The store-gateway needs not need persistent storage, but we still run it as a StatefulSet
-      # This is to avoid having blocks of data being
+        # The store-gateway needs not need persistent storage, but we still run it as a StatefulSet
+        # This is to avoid having blocks of data being
         enabled: false
       resources:
         limits:
@@ -76,15 +77,12 @@ pyroscope:
         requests:
           memory: 8Gi
           cpu: 1
-    tenant-settings:
-      kind: Deployment
-      replicaCount: 1
-      resources:
-        limits:
-          memory: 1Gi
-        requests:
-          memory: 256Mi
-          cpu: 1
-
+      readinessProbe:
+        # The store gateway can be configured to wait on startup for ring stability to be reached before it becomes
+        # ready. See the `store-gateway.sharding-ring.wait-stability-min-duration` server argument for more information.
+        #
+        # Depending on this flag and the number of tenants + blocks that need to be synced on startup, pods can take
+        # some time to become ready. This value can be used to ensure Kubernetes waits long enough and reduce errors.
+        initialDelaySeconds: 60
 minio:
   enabled: true

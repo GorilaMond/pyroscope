@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/grafana/dskit/tenant"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
@@ -60,13 +60,14 @@ func (f *Frontend) SelectSeries(ctx context.Context,
 		r := intervals.At()
 		g.Go(func() error {
 			req := connectgrpc.CloneRequest(c, &querierv1.SelectSeriesRequest{
-				ProfileTypeID: c.Msg.ProfileTypeID,
-				LabelSelector: c.Msg.LabelSelector,
-				Start:         r.Start.UnixMilli(),
-				End:           r.End.UnixMilli(),
-				GroupBy:       c.Msg.GroupBy,
-				Step:          c.Msg.Step,
-				Aggregation:   c.Msg.Aggregation,
+				ProfileTypeID:      c.Msg.ProfileTypeID,
+				LabelSelector:      c.Msg.LabelSelector,
+				Start:              r.Start.UnixMilli(),
+				End:                r.End.UnixMilli(),
+				GroupBy:            c.Msg.GroupBy,
+				Step:               c.Msg.Step,
+				Aggregation:        c.Msg.Aggregation,
+				StackTraceSelector: c.Msg.StackTraceSelector,
 			})
 			resp, err := connectgrpc.RoundTripUnary[
 				querierv1.SelectSeriesRequest,

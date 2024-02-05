@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -35,6 +35,7 @@ const (
 	DefaultMinFreeDisk                        = 10
 	DefaultMinDiskAvailablePercentage         = 0.05
 	DefaultRetentionPolicyEnforcementInterval = 5 * time.Minute
+	DefaultRetentionExpiry                    = 4 * time.Hour // Same as default `querier.query_store_after`.
 )
 
 type Config struct {
