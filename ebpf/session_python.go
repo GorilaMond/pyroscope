@@ -209,7 +209,7 @@ func (s *session) loadPyPerf() (*python.Perf, error) {
 			LogDisabled: true,
 		},
 		MapReplacements: map[string]*ebpf.Map{
-			"stacks": s.bpf.Stacks,
+			"stacks": s.stackbpf.Stacks(),
 		},
 	}
 
@@ -222,7 +222,7 @@ func (s *session) loadPyPerf() (*python.Perf, error) {
 		return nil, fmt.Errorf("pyperf create %w", err)
 	}
 	// profile.bpf.c 的 progs map 的 0号元素 更新为 bpf/pyperf.bpf.c pyperf_collect
-	err = s.bpf.ProfileMaps.Progs.Update(uint32(0), s.pyperfBpf.PerfPrograms.PyperfCollect, ebpf.UpdateAny)
+	err = s.stackbpf.Progs().Update(uint32(0), s.pyperfBpf.PerfPrograms.PyperfCollect, ebpf.UpdateAny)
 	if err != nil {
 		return nil, fmt.Errorf("pyperf link %w", err)
 	}

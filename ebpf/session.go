@@ -22,7 +22,6 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/pyroscope/ebpf/cpuonline"
 	"github.com/grafana/pyroscope/ebpf/metrics"
 	"github.com/grafana/pyroscope/ebpf/pyrobpf"
 	"github.com/grafana/pyroscope/ebpf/python"
@@ -41,6 +40,8 @@ type SessionOptions struct {
 	CacheOptions              symtab.CacheOptions
 	Metrics                   *metrics.Metrics
 	SampleRate                int
+	BPFType                   string
+	BPFOption                 string
 }
 
 type SampleAggregation bool
@@ -62,6 +63,7 @@ type Session interface {
 	UpdateTargets(args sd.TargetsOptions)
 	CollectProfiles(f CollectProfilesCallback) error
 	DebugInfo() interface{}
+	Scale() Scale
 }
 
 type SessionDebugInfo struct {
@@ -78,16 +80,14 @@ type pids struct {
 	all map[uint32]procInfoLite
 }
 type session struct {
+	// 错误信息输出流
 	logger log.Logger
 
 	targetFinder sd.TargetFinder
 
-	perfEvents []*perfEvent
+	stackbpf StackBPF
 
-	symCache *symtab.SymbolCache
-
-	bpf pyrobpf.ProfileObjects
-
+	symCache        *symtab.SymbolCache
 	eventsReader    *perf.Reader
 	pidInfoRequests chan uint32
 	deadPIDEvents   chan uint32
@@ -142,6 +142,10 @@ func NewSession(
 	}, nil
 }
 
+func (s *session) Scale() Scale {
+	return s.stackbpf.Scale()
+}
+
 func (s *session) Start() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -151,29 +155,37 @@ func (s *session) Start() error {
 		return err
 	}
 
-	opts := &ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			LogDisabled: true,
-		},
+	// 加载eBPF程序
+	switch s.options.BPFType {
+	default:
+		s.stackbpf = &OnCPUStackBPF{}
+	case "off-cpu":
+		s.stackbpf = &OffCPUStackBPF{}
 	}
-	if err := pyrobpf.LoadProfileObjects(&s.bpf, opts); err != nil {
+	if s.stackbpf.Config(s.options.BPFOption) != nil {
+		s.stopLocked()
+		return fmt.Errorf("config bpf objects: %w", err)
+	}
+	if s.stackbpf.Load() != nil { // lb
 		s.stopLocked()
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 
 	btf.FlushKernelSpec() // save some memory
 
-	eventsReader, err := perf.NewReader(s.bpf.ProfileMaps.Events, 4*os.Getpagesize())
+	// 创建perfevent接收器
+	eventsReader, err := perf.NewReader(s.stackbpf.Events(), 4*os.Getpagesize()) // lb
 	if err != nil {
 		s.stopLocked()
 		return fmt.Errorf("perf new reader for events map: %w", err)
 	}
-	s.perfEvents, err = attachPerfEvents(s.options.SampleRate, s.bpf.DoPerfEvent)
-	if err != nil {
+
+	// 绑定perf和ebpf程序，获取连接
+	if s.stackbpf.Attach() != nil {
 		s.stopLocked()
-		return fmt.Errorf("attach perf events: %w", err)
 	}
 
+	// 绑定 监测进程相关的kprobe
 	err = s.linkKProbes()
 	if err != nil {
 		s.stopLocked()
@@ -201,10 +213,12 @@ func (s *session) Start() error {
 	}()
 	go func() {
 		defer s.wg.Done()
+		// 进程退出时，将退出的被监测进程从pids中剔除
 		s.processDeadPIDsEvents(deadPIDsEvents)
 	}()
 	go func() {
 		defer s.wg.Done()
+		// 进程创建时，将创建的进程加入监测进程列表
 		s.processPIDExecRequests(pidExecRequests)
 	}()
 	return nil
@@ -223,6 +237,7 @@ func (s *session) Update(options SessionOptions) error {
 	return nil
 }
 
+// 更新目标查找器，并解析pid类型
 func (s *session) UpdateTargets(args sd.TargetsOptions) {
 	s.targetFinder.Update(args)
 
@@ -234,6 +249,7 @@ func (s *session) UpdateTargets(args sd.TargetsOptions) {
 		if target == nil {
 			continue
 		}
+		// 分析pid对应进程的类型并添加进pid表
 		s.startProfilingLocked(pid, target)
 		delete(s.pids.unknown, pid)
 	}
@@ -243,6 +259,7 @@ func (s *session) CollectProfiles(cb CollectProfilesCallback) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	// 增加数据发送轮数
 	s.symCache.NextRound()
 	s.roundNumber++
 
@@ -251,6 +268,7 @@ func (s *session) CollectProfiles(cb CollectProfilesCallback) error {
 		return err
 	}
 
+	// 收集数据
 	err = s.collectRegularProfile(cb)
 	if err != nil {
 		return err
@@ -271,10 +289,13 @@ func (s *session) DebugInfo() interface{} {
 	}
 }
 
-// 调用栈解析函数
+// 数据收集函数，调用特定函数进行处理
+//
+// 整合 stack map 和 count map，最后按一定条件清空map
 func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 	sb := &stackBuilder{}
 
+	// 获取counts map键值对
 	keys, values, batch, err := s.getCountsMapValues()
 	if err != nil {
 		return fmt.Errorf("get counts map: %w", err)
@@ -333,13 +354,16 @@ func (s *session) collectRegularProfile(cb CollectProfilesCallback) error {
 			continue // only comm
 		}
 		lo.Reverse(sb.stack)
+		// 调用回调函数构造样本
 		cb(labels, sb.stack, uint64(value), ck.Pid, SampleAggregated)
 		s.collectMetrics(labels, &stats, sb)
 	}
 
+	// 从counts中清空keys，若已批处理过，会直接返回
 	if err = s.clearCountsMap(keys, batch); err != nil {
 		return fmt.Errorf("clear counts map %w", err)
 	}
+	// 从stacks中清空已知调用栈，每10轮进行一次全面清空
 	if err = s.clearStacksMap(knownStacks); err != nil {
 		return fmt.Errorf("clear stacks map %w", err)
 	}
@@ -376,15 +400,13 @@ func (s *session) stopAndWait() {
 }
 
 func (s *session) stopLocked() {
-	for _, pe := range s.perfEvents {
-		_ = pe.Close()
-	}
-	s.perfEvents = nil
+	s.stackbpf.Detach()
+
 	for _, kprobe := range s.kprobes {
 		_ = kprobe.Close()
 	}
 	s.kprobes = nil
-	_ = s.bpf.Close()
+	s.stackbpf.Remove()
 	if s.pyperf != nil {
 		s.pyperf.Close()
 	}
@@ -410,6 +432,7 @@ func (s *session) stopLocked() {
 	s.started = false
 }
 
+// 更新pid表类型信息
 func (s *session) setPidConfig(pid uint32, pi procInfoLite, collectUser bool, collectKernel bool) {
 	// 更新用户态pid表信息
 	s.pids.all[pid] = pi
@@ -420,7 +443,7 @@ func (s *session) setPidConfig(pid uint32, pi procInfoLite, collectUser bool, co
 	}
 
 	// 更新内核态pid表配置
-	if err := s.bpf.Pids.Update(&pid, config, ebpf.UpdateAny); err != nil {
+	if err := s.stackbpf.Pids().Update(&pid, config, ebpf.UpdateAny); err != nil {
 		_ = level.Error(s.logger).Log("msg", "updating pids map", "err", err)
 	}
 }
@@ -432,34 +455,13 @@ func uint8FromBool(b bool) uint8 {
 	return 0
 }
 
-func attachPerfEvents(sampleRate int, prog *ebpf.Program) ([]*perfEvent, error) {
-	var perfEvents []*perfEvent
-	var cpus []uint
-	var err error
-	if cpus, err = cpuonline.Get(); err != nil {
-		return nil, fmt.Errorf("get cpuonline: %w", err)
-	}
-	for _, cpu := range cpus {
-		pe, err := newPerfEvent(int(cpu), sampleRate)
-		if err != nil {
-			return perfEvents, fmt.Errorf("new perf event: %w", err)
-		}
-		perfEvents = append(perfEvents, pe)
-
-		err = pe.attachPerfEvent(prog)
-		if err != nil {
-			return perfEvents, fmt.Errorf("attach perf event: %w", err)
-		}
-	}
-	return perfEvents, nil
-}
-
 func (s *session) GetStack(stackId int64) []byte {
 	if stackId < 0 {
 		return nil
 	}
 	stackIdU32 := uint32(stackId)
-	res, err := s.bpf.ProfileMaps.Stacks.LookupBytes(stackIdU32)
+	// res, err := s.bpf.ProfileMaps.Stacks.LookupBytes(stackIdU32)
+	res, err := s.stackbpf.Stacks().LookupBytes(stackIdU32)
 	if err != nil {
 		return nil
 	}
@@ -613,6 +615,7 @@ func (s *session) processPidInfoRequests(pidInfoRequests <-chan uint32) {
 	}
 }
 
+// 分析pid类型并添加到pid表中
 func (s *session) startProfilingLocked(pid uint32, target *sd.Target) {
 	if !s.started {
 		return
@@ -730,11 +733,12 @@ func (s *session) linkKProbes() error {
 		archSys = "__arm64_"
 	}
 	hooks = []hook{
-		{kprobe: "disassociate_ctty", prog: s.bpf.DisassociateCtty, required: true},
-		{kprobe: archSys + "sys_execve", prog: s.bpf.Exec, required: false},
-		{kprobe: archSys + "sys_execveat", prog: s.bpf.Exec, required: false},
+		{kprobe: "disassociate_ctty", prog: s.stackbpf.DisassociateCtty(), required: true},
+		{kprobe: archSys + "sys_execve", prog: s.stackbpf.Exec(), required: false},
+		{kprobe: archSys + "sys_execveat", prog: s.stackbpf.Exec(), required: false},
 	}
 	for _, it := range hooks {
+		// 绑定kprobe
 		kp, err := link.Kprobe(it.kprobe, it.prog, nil)
 		if err != nil {
 			if it.required {
@@ -760,7 +764,7 @@ func (s *session) cleanup() {
 		if s.pyperf != nil {
 			s.pyperf.RemoveDeadPID(pid)
 		}
-		if err := s.bpf.Pids.Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		if err := s.stackbpf.Pids().Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) { // lb
 			_ = level.Error(s.logger).Log("msg", "delete pid config", "pid", pid, "err", err)
 		}
 		s.targetFinder.RemoveDeadPID(pid)
@@ -774,7 +778,7 @@ func (s *session) cleanup() {
 			}
 			delete(s.pids.unknown, pid)
 			delete(s.pids.all, pid)
-			if err := s.bpf.Pids.Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			if err := s.stackbpf.Pids().Delete(pid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) { // lb
 				_ = level.Error(s.logger).Log("msg", "delete pid config", "pid", pid, "err", err)
 			}
 		}
@@ -789,7 +793,7 @@ func (s *session) cleanup() {
 // it is only needed in case disassociate_ctty hook somehow mises a process death
 func (s *session) checkStalePids() {
 	var (
-		m       = s.bpf.Pids
+		m       = s.stackbpf.Pids() // lb
 		mapSize = m.MaxEntries()
 		nextKey = uint32(0)
 	)

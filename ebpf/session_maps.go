@@ -17,7 +17,7 @@ import (
 func (s *session) getCountsMapValues() (keys []pyrobpf.ProfileSampleKey, values []uint32, batch bool, err error) {
 	// try batch first
 	var (
-		m       = s.bpf.ProfileMaps.Counts
+		m       = s.stackbpf.Counts()
 		mapSize = m.MaxEntries()
 		nextKey = pyrobpf.ProfileSampleKey{}
 	)
@@ -71,7 +71,7 @@ func (s *session) clearCountsMap(keys []pyrobpf.ProfileSampleKey, batch bool) er
 		// do nothing, already deleted with GetValueAndDeleteBatch in getCountsMapValues
 		return nil
 	}
-	m := s.bpf.ProfileMaps.Counts
+	m := s.stackbpf.Counts()
 	for i := range keys {
 		err := m.Delete(&keys[i])
 		if err != nil {
@@ -86,7 +86,7 @@ func (s *session) clearCountsMap(keys []pyrobpf.ProfileSampleKey, batch bool) er
 }
 
 func (s *session) clearStacksMap(knownKeys map[uint32]bool) error {
-	m := s.bpf.Stacks
+	m := s.stackbpf.Stacks()
 	cnt := 0
 	errs := 0
 	if s.roundNumber%10 == 0 {

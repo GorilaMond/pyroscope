@@ -14,6 +14,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/go-kit/log"
+	"github.com/google/pprof/profile"
 	ebpfmetrics "github.com/grafana/pyroscope/ebpf/metrics"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
@@ -45,44 +46,64 @@ var (
 
 func main() {
 	config = getConfig()
+	// 创建客户端性能指标
 	metrics = ebpfmetrics.New(prometheus.DefaultRegisterer)
 
+	// 创建记录器并将输出流设定到标准错误
 	logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 
+	// 创建并设定目标查找器
 	targetFinder, err := sd.NewTargetFinder(os.DirFS("/"), logger, convertTargetOptions())
 	if err != nil {
 		panic(fmt.Errorf("ebpf target finder create: %w", err))
 	}
+	// 根据config创建eBPF监测选项
 	options := convertSessionOptions()
+	// 创建eBPF监测会话
 	session, err = ebpfspy.NewSession(
 		logger,
 		targetFinder,
 		options,
 	)
+	// 开始eBPF监测
 	err = session.Start()
 	if err != nil {
 		panic(err)
 	}
 
+	// 创建画像数据发送信道
 	profiles := make(chan *pushv1.PushRequest, 128)
 	go ingest(profiles)
 	for {
 		time.Sleep(5 * time.Second)
 
+		// 收集画像数据传送给数据信道
 		collectProfiles(profiles)
 
+		// 以当前命名空间所有符合规则的进程更新目标查找器，并解析未知pid
 		session.UpdateTargets(convertTargetOptions())
 	}
 }
 
+// 收集数据并传给信道
 func collectProfiles(profiles chan *pushv1.PushRequest) {
+	// 创建进程数据构建器群
 	builders := pprof.NewProfileBuilders(int64(config.SampleRate))
+	// 设定数据提取函数
 	err := session.CollectProfiles(func(target *sd.Target, stack []string, value uint64, pid uint32, aggregation ebpfspy.SampleAggregation) {
+		// 获取进程哈希值和进程标签组
 		labelsHash, labels := target.Labels()
 		builder := builders.BuilderForTarget(labelsHash, labels)
+		s := session.Scale()
+		p := builder.Profile
+		p.SampleType = []*profile.ValueType{{Type: s.Type, Unit: s.Unit}}
+		p.Period = s.Period
+		p.PeriodType = &profile.ValueType{Type: s.Type, Unit: s.Unit}
+		// 若eBPF中对数据已经进行了累计
 		if aggregation == ebpfspy.SampleAggregated {
 			builder.CreateSample(stack, value)
 		} else {
+			// 否则，在用户态进行累计
 			builder.CreateSampleOrAddValue(stack, value)
 		}
 	})
@@ -93,6 +114,7 @@ func collectProfiles(profiles chan *pushv1.PushRequest) {
 	level.Debug(logger).Log("msg", "ebpf collectProfiles done", "profiles", len(builders.Builders))
 
 	for _, builder := range builders.Builders {
+		// 将进程标签组转换为标准类型组
 		protoLabels := make([]*typesv1.LabelPair, 0, builder.Labels.Len())
 		for _, label := range builder.Labels {
 			protoLabels = append(protoLabels, &typesv1.LabelPair{
@@ -100,11 +122,14 @@ func collectProfiles(profiles chan *pushv1.PushRequest) {
 			})
 		}
 
+		// 向缓存中写入样本数据
 		buf := bytes.NewBuffer(nil)
 		_, err := builder.Write(buf)
 		if err != nil {
 			panic(err)
 		}
+
+		// 创建一个push请求
 		req := &pushv1.PushRequest{Series: []*pushv1.RawProfileSeries{{
 			Labels: protoLabels,
 			Samples: []*pushv1.RawSample{{
@@ -112,7 +137,9 @@ func collectProfiles(profiles chan *pushv1.PushRequest) {
 			}},
 		}}}
 		select {
+		// 传给信道
 		case profiles <- req:
+		// 传送失败则记录
 		default:
 			_ = level.Error(logger).Log("err", "dropping profile", "target", builder.Labels.String())
 		}
@@ -124,6 +151,7 @@ func collectProfiles(profiles chan *pushv1.PushRequest) {
 	}
 }
 
+// 接收信道数据并发送
 func ingest(profiles chan *pushv1.PushRequest) {
 	httpClient, err := commonconfig.NewClientFromConfig(commonconfig.DefaultHTTPClientConfig, "http_playground")
 	if err != nil {
@@ -144,8 +172,13 @@ func ingest(profiles chan *pushv1.PushRequest) {
 
 }
 
+// 由当前命名空间所有符合规则的进程生成目标选项
 func convertTargetOptions() sd.TargetsOptions {
 	return sd.TargetsOptions{
+		// 只监控给定目标
+		// 设定为当前所有进程中满足规则的进程目标列表
+		// 默认目标
+		// pid->cid 映射表缓存大小
 		TargetsOnly:        config.TargetsOnly,
 		Targets:            relabelProcessTargets(getProcessTargets(), config.RelabelConfig),
 		DefaultTarget:      config.DefaultTarget,
@@ -163,6 +196,8 @@ func convertSessionOptions() ebpfspy.SessionOptions {
 		PythonEnabled:             config.PythonEnabled,
 		Metrics:                   metrics,
 		CacheOptions:              config.CacheOptions,
+		BPFType:                   config.BPFType,
+		BPFOption:                 config.BPFOption,
 	}
 }
 
@@ -215,6 +250,8 @@ var defaultConfig = Config{
 	DefaultTarget:      nil,
 	ContainerCacheSize: 1024,
 	RelabelConfig:      nil,
+	BPFType:            "on-cpu",
+	BPFOption:          "49",
 }
 
 type Config struct {
@@ -229,6 +266,8 @@ type Config struct {
 	DefaultTarget             map[string]string
 	ContainerCacheSize        int
 	RelabelConfig             []*RelabelConfig
+	BPFType                   string
+	BPFOption                 string
 }
 
 type RelabelConfig struct {
@@ -245,6 +284,7 @@ type RelabelConfig struct {
 	Action string
 }
 
+// 由当前命名空间的所有进程生成已发现目标的列表
 func getProcessTargets() []sd.DiscoveryTarget {
 	dir, err := os.ReadDir("/proc")
 	if err != nil {
@@ -289,6 +329,7 @@ func getProcessTargets() []sd.DiscoveryTarget {
 				_ = level.Error(logger).Log("err", err, "msg", "reading cgroup", "pid", spid)
 			}
 		}
+		// 初始进程元数据
 		target := sd.DiscoveryTarget{
 			"__process_pid__":       spid,
 			"__meta_process_cwd":    cwd,
@@ -302,6 +343,7 @@ func getProcessTargets() []sd.DiscoveryTarget {
 	return res
 }
 
+// 对已找到目标列表根据配置进行过滤
 func relabelProcessTargets(targets []sd.DiscoveryTarget, cfg []*RelabelConfig) []sd.DiscoveryTarget {
 	var promConfig []*relabel.Config
 	for _, c := range cfg {
@@ -320,11 +362,15 @@ func relabelProcessTargets(targets []sd.DiscoveryTarget, cfg []*RelabelConfig) [
 	}
 	var res []sd.DiscoveryTarget
 	for _, target := range targets {
+		// lbls对应一个进程
 		lbls := labels.FromMap(target)
+		// 对进程标签进行规则匹配
 		lbls, keep := relabel.Process(lbls, promConfig...)
+		// 规则返回不保留，继续下次
 		if !keep {
 			continue
 		}
+		// 否则，添加到返回列表中
 		tt := sd.DiscoveryTarget(lbls.Map())
 		_ = level.Debug(logger).Log("msg", "relabelled process", "target", tt.DebugString())
 		res = append(res, tt)
